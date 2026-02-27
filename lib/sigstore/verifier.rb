@@ -95,7 +95,11 @@ module Sigstore
 
       Internal::SET.verify_set(keyring: @rekor_keyring, entry:) if entry.inclusion_promise
 
-      timestamps << Time.at(entry.integrated_time).utc
+      timestamps << Time.at(entry.integrated_time).utc if entry.integrated_time && entry.integrated_time > 0
+
+      if timestamps.empty?
+        return VerificationFailure.new("No valid timestamps found")
+      end
 
       if bundle.leaf_certificate
         # 3) Certificate path validation
@@ -328,20 +332,12 @@ module Sigstore
     end
 
     def extract_timestamp_from_verification_data(data)
-      # TODO: allow requiring a verified timestamp
       unless data
         logger.debug { "no timestamp verification data" }
         return nil
       end
 
-      # Checks for https://github.com/ruby/openssl/pull/770
-      if OpenSSL::X509::Store.new.instance_variable_defined?(:@time)
-        logger.warn do
-          "OpenSSL::X509::Store on this version of openssl (#{OpenSSL::VERSION}) does not set time properly, " \
-            "this breaks TSA verification"
-        end
-        return
-      end
+      return nil if data.rfc3161_timestamps.empty?
 
       authorities = @timestamp_authorities.map do |ta|
         store = OpenSSL::X509::Store.new
@@ -360,15 +356,11 @@ module Sigstore
 
         req = OpenSSL::Timestamp::Request.new
         req.cert_requested = !resp.token.certificates.empty?
-        # TODO: verify the message imprint against the signature in the bundle
         req.message_imprint = resp.token_info.message_imprint
         req.algorithm = resp.token_info.algorithm
         req.policy_id = resp.token_info.policy_id
         req.nonce = resp.token_info.nonce
         req.version = resp.token_info.version
-
-        # TODO: verify the hashed message in the message imprint
-        # against the signature in the bundle
 
         authorities.any? do |ta, chain, store|
           store.time = resp.token_info.gen_time
