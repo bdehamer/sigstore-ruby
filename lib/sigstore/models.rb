@@ -76,10 +76,10 @@ module Sigstore
   end
 
   class VerificationInput < DelegateClass(Verification::V1::Input)
-    attr_reader :trusted_root, :sbundle, :hashed_input
+    attr_reader :trusted_root, :sbundle, :hashed_input, :public_key
 
-    def initialize(*)
-      super
+    def initialize(*, public_key: nil)
+      super(*)
 
       unless bundle.is_a?(Bundle::V1::Bundle)
         raise ArgumentError,
@@ -88,6 +88,7 @@ module Sigstore
 
       @trusted_root = TrustedRoot.new(artifact_trust_root)
       @sbundle = SBundle.new(bundle)
+      @public_key = public_key
       if sbundle.message_signature? && !artifact
         raise Error::InvalidVerificationInput, "bundle with message_signature requires an artifact"
       end
@@ -138,23 +139,34 @@ module Sigstore
       new(bundle)
     end
 
-    def expected_tlog_entry(hashed_input)
+    def expected_tlog_entry(hashed_input, public_key: nil)
+      rekor_entry = verification_material.tlog_entries.first
+      canonicalized_body = begin
+        JSON.parse(rekor_entry.canonicalized_body)
+      rescue JSON::ParserError
+        raise Error::InvalidBundle, "expected canonicalized_body to be JSON"
+      end
+
+      kind_version = canonicalized_body.values_at("kind", "apiVersion")
+
       case content
       when :message_signature
-        expected_hashed_rekord_tlog_entry(hashed_input)
-      when :dsse_envelope
-        rekor_entry = verification_material.tlog_entries.first
-        canonicalized_body = begin
-          JSON.parse(rekor_entry.canonicalized_body)
-        rescue JSON::ParserError
-          raise Error::InvalidBundle, "expected canonicalized_body to be JSON"
+        case kind_version
+        when %w[hashedrekord 0.0.1]
+          expected_hashed_rekord_tlog_entry(hashed_input, public_key: public_key)
+        when %w[hashedrekord 0.0.2]
+          expected_hashed_rekord_v002_tlog_entry(hashed_input)
+        else
+          raise Error::InvalidRekorEntry, "Unhandled rekor entry kind/version: #{kind_version.inspect}"
         end
-
-        case kind_version = canonicalized_body.values_at("kind", "apiVersion")
+      when :dsse_envelope
+        case kind_version
         when %w[dsse 0.0.1]
           expected_dsse_0_0_1_tlog_entry
         when %w[intoto 0.0.2]
           expected_intoto_0_0_2_tlog_entry
+        when %w[dsse 0.0.2]
+          expected_dsse_v002_tlog_entry
         else
           raise Error::InvalidRekorEntry, "Unhandled rekor entry kind/version: #{kind_version.inspect}"
         end
@@ -193,7 +205,7 @@ module Sigstore
 
       case verification_material.content
       when :public_key
-        raise Error::Unimplemented, "public_key content of bundle"
+        @leaf_certificate = nil
       when :x509_certificate_chain
         certs = verification_material.x509_certificate_chain.certificates.map do |cert|
           Internal::X509::Certificate.read(cert.raw_bytes)
@@ -208,16 +220,21 @@ module Sigstore
       else
         raise Error::InvalidBundle, "Unsupported bundle content: #{content.inspect}"
       end
-      raise Error::InvalidBundle, "expected certificate to be leaf" unless @leaf_certificate.leaf?
+      raise Error::InvalidBundle, "expected certificate to be leaf" if @leaf_certificate && !@leaf_certificate.leaf?
     end
 
-    def expected_hashed_rekord_tlog_entry(hashed_input)
+    def expected_hashed_rekord_tlog_entry(hashed_input, public_key: nil)
+      key_content = if public_key
+                      Internal::Util.base64_encode(public_key.to_pem)
+                    else
+                      Internal::Util.base64_encode(leaf_certificate.to_pem)
+                    end
       {
         "spec" => {
           "signature" => {
             "content" => Internal::Util.base64_encode(message_signature.signature),
             "publicKey" => {
-              "content" => Internal::Util.base64_encode(leaf_certificate.to_pem)
+              "content" => key_content
             }
           },
           "data" => {
@@ -281,6 +298,83 @@ module Sigstore
             end
         }
       }
+    end
+
+    def expected_hashed_rekord_v002_tlog_entry(hashed_input)
+      algorithm = case hashed_input.algorithm
+                  when Common::V1::HashAlgorithm::SHA2_256 then "SHA2_256"
+                  when Common::V1::HashAlgorithm::SHA2_384 then "SHA2_384"
+                  when Common::V1::HashAlgorithm::SHA2_512 then "SHA2_512"
+                  else
+                    raise ArgumentError, "unsupported hash algorithm: #{hashed_input.algorithm.inspect}"
+                  end
+      {
+        "apiVersion" => "0.0.2",
+        "kind" => "hashedrekord",
+        "spec" => {
+          "hashedRekordV002" => {
+            "data" => {
+              "algorithm" => algorithm,
+              "digest" => Internal::Util.base64_encode(hashed_input.digest)
+            },
+            "signature" => {
+              "content" => Internal::Util.base64_encode(message_signature.signature),
+              "verifier" => v002_verifier
+            }
+          }
+        }
+      }
+    end
+
+    def expected_dsse_v002_tlog_entry
+      {
+        "apiVersion" => "0.0.2",
+        "kind" => "dsse",
+        "spec" => {
+          "dsseV002" => {
+            "payloadHash" => {
+              "algorithm" => "SHA2_256",
+              "digest" => Internal::Util.base64_encode(OpenSSL::Digest::SHA256.digest(dsse_envelope.payload))
+            },
+            "signatures" =>
+              dsse_envelope.signatures.map do |sig|
+                {
+                  "content" => Internal::Util.base64_encode(sig.sig),
+                  "verifier" => v002_verifier
+                }
+              end
+          }
+        }
+      }
+    end
+
+    def v002_verifier
+      key_details = key_details_for_certificate(leaf_certificate)
+      {
+        "keyDetails" => key_details,
+        "x509Certificate" => {
+          "rawBytes" => Internal::Util.base64_encode(leaf_certificate.to_der)
+        }
+      }
+    end
+
+    def key_details_for_certificate(cert)
+      public_key = cert.public_key
+      case public_key
+      when OpenSSL::PKey::EC
+        case public_key.group.curve_name
+        when "prime256v1"
+          "PKIX_ECDSA_P256_SHA_256"
+        when "secp384r1"
+          "PKIX_ECDSA_P384_SHA_384"
+        when "secp521r1"
+          "PKIX_ECDSA_P521_SHA_512"
+        else
+          raise Error::Unimplemented, "unsupported EC curve: #{public_key.group.curve_name}"
+        end
+      else
+        raise Error::Unimplemented, "unsupported public key type: #{public_key.class}"
+      end
     end
   end
 end

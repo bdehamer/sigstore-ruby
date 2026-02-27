@@ -52,14 +52,21 @@ module Sigstore
     option :bundle, type: :string, desc: "Path to the signed bundle"
     option :trusted_root, type: :string, desc: "Path to the trusted root"
     option :update_trusted_root, type: :boolean, desc: "Update the trusted root", default: true
+    option :key, type: :string, desc: "Path to the public key (PEM) for managed key verification"
     exclusive :bundle, :signature
     exclusive :bundle, :certificate
     def verify(*files)
       verifier, files_with_materials = collect_verification_state(files)
-      policy = Sigstore::Policy::Identity.new(
-        identity: options[:certificate_identity],
-        issuer: options[:certificate_oidc_issuer]
-      )
+
+      if options[:key]
+        # Public key verification — no identity policy needed
+        policy = Sigstore::Policy::UnsafeNoOp.new
+      else
+        policy = Sigstore::Policy::Identity.new(
+          identity: options[:certificate_identity],
+          issuer: options[:certificate_oidc_issuer]
+        )
+      end
 
       verified = files_with_materials.all? do |file, input|
         result = verifier.verify(input:, policy:, offline: options[:offline])
@@ -259,7 +266,10 @@ module Sigstore
         end
 
         say "Verifying #{file}..."
-        all_materials << [file, Sigstore::VerificationInput.new(verification_input)]
+        public_key = if options[:key]
+                       OpenSSL::PKey.read(File.binread(options[:key]))
+                     end
+        all_materials << [file, Sigstore::VerificationInput.new(verification_input, public_key: public_key)]
       end
 
       [verifier, all_materials]

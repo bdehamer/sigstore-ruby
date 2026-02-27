@@ -87,6 +87,27 @@ module Sigstore
       end
     end
 
+    class AllOf
+      def initialize(*policies)
+        @policies = policies
+      end
+
+      def verify(cert)
+        @policies.each do |policy|
+          result = policy.verify(cert)
+          return result unless result.verified?
+        end
+
+        VerificationSuccess.new
+      end
+    end
+
+    class UnsafeNoOp
+      def verify(_cert)
+        VerificationSuccess.new
+      end
+    end
+
     class Identity
       def initialize(identity:, issuer:)
         @identity = identity

@@ -29,10 +29,13 @@ module Sigstore
         when Common::V1::PublicKeyDetails::PKCS1_RSA_PKCS1V5
           key_type = "rsa"
           key_schema = "rsa-pkcs1v15-sha256"
+        when Common::V1::PublicKeyDetails::PKIX_ED25519
+          key_type = "ed25519"
+          key_schema = "ed25519"
         else
           # Skip unrecognized key types instead of raising an error.
           # This allows the library to work with newer trusted roots that include
-          # key types we don't yet support (e.g., PKIX_ED25519 for Rekor v2).
+          # key types we don't yet support.
           logger.warn { "Skipping unrecognized key type: #{key_details}" }
           return nil
         end
@@ -46,7 +49,11 @@ module Sigstore
           pkey = OpenSSL::PKey::EC.new(key_bytes)
           EDCSA.new(key_type, schema, pkey, key_id:)
         when "ed25519"
-          pkey = ED25519.pkey_from_der([key_bytes].pack("H*"))
+          pkey = begin
+            OpenSSL::PKey.read(key_bytes)
+          rescue OpenSSL::PKey::PKeyError
+            ED25519.pkey_from_der([key_bytes].pack("H*"))
+          end
           ED25519.new(key_type, schema, pkey, key_id:)
         when "rsa"
           pkey = OpenSSL::PKey::RSA.new(key_bytes)
@@ -172,6 +179,13 @@ module Sigstore
           else
             raise ArgumentError, "Unsupported schema #{schema}"
           end
+        end
+
+        def to_der
+          @key.public_to_der
+        rescue NoMethodError
+          # Fallback for OpenSSL versions where public_to_der is not available
+          @key.to_pem.then { |pem| OpenSSL::PKey.read(pem).to_der }
         end
 
         def verify(_algo, signature, data)
