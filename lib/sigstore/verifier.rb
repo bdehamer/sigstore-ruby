@@ -67,7 +67,22 @@ module Sigstore
       # of the signature as the timestamped data. The Verifier MUST then extract a timestamp from the timestamping
       # response. If verification or timestamp parsing fails, the Verifier MUST abort.
 
-      timestamps = extract_timestamp_from_verification_data(materials.timestamp_verification_data) || []
+      # Extract the signature from the bundle for timestamp verification
+      bundle_signature = case bundle.content
+                         when :message_signature
+                           bundle.message_signature.signature
+                         when :dsse_envelope
+                           # For DSSE, the PAE-encoded envelope is signed
+                           pae = "DSSEv1 #{bundle.dsse_envelope.payloadType.bytesize} " \
+                                 "#{bundle.dsse_envelope.payloadType} " \
+                                 "#{bundle.dsse_envelope.payload.bytesize} " \
+                                 "#{bundle.dsse_envelope.payload}".b
+                           bundle.dsse_envelope.signatures.first&.sig
+                         end
+
+      timestamps = extract_timestamp_from_verification_data(
+        materials.timestamp_verification_data, signature: bundle_signature
+      ) || []
 
       # 2)
       # If the verification policy uses timestamps from the Transparency Service, the Verifier MUST verify the signature
@@ -331,7 +346,7 @@ module Sigstore
       issuer
     end
 
-    def extract_timestamp_from_verification_data(data)
+    def extract_timestamp_from_verification_data(data, signature: nil)
       unless data
         logger.debug { "no timestamp verification data" }
         return nil
@@ -339,7 +354,14 @@ module Sigstore
 
       return nil if data.rfc3161_timestamps.empty?
 
-      authorities = @timestamp_authorities.map do |ta|
+      authorities = @timestamp_authorities.filter_map do |ta|
+        # Check TSA validity period against trusted root
+        if ta.valid_for
+          now = Time.now.utc
+          next if ta.valid_for.start && now < ta.valid_for.start.to_time
+          # Don't filter on end time here — the timestamp gen_time will be checked later
+        end
+
         store = OpenSSL::X509::Store.new
         chain = ta.cert_chain.certificates.map do |cert|
           Internal::X509::Certificate.read(cert.raw_bytes).openssl
@@ -354,6 +376,16 @@ module Sigstore
       data.rfc3161_timestamps.map do |ts|
         resp = OpenSSL::Timestamp::Response.new(ts.signed_timestamp)
 
+        # Verify the message imprint matches the hash of the signature
+        if signature
+          expected_imprint = OpenSSL::Digest::SHA256.digest(signature)
+          actual_imprint = resp.token_info.message_imprint
+          unless actual_imprint == expected_imprint
+            raise OpenSSL::Timestamp::TimestampError,
+                  "timestamp message imprint does not match signature"
+          end
+        end
+
         req = OpenSSL::Timestamp::Request.new
         req.cert_requested = !resp.token.certificates.empty?
         req.message_imprint = resp.token_info.message_imprint
@@ -362,7 +394,17 @@ module Sigstore
         req.nonce = resp.token_info.nonce if resp.token_info.nonce
         req.version = resp.token_info.version
 
-        authorities.any? do |ta, chain, store|
+        # Check that the timestamp gen_time falls within the TSA's validity period
+        verified = authorities.any? do |ta, chain, store|
+          # Check TSA validity against the timestamp gen_time
+          if ta.valid_for&.end
+            tsa_end = ta.valid_for.end.to_time
+            if resp.token_info.gen_time > tsa_end
+              logger.debug { "timestamp gen_time #{resp.token_info.gen_time} is after TSA validity end #{tsa_end}" }
+              next false
+            end
+          end
+
           store.time = resp.token_info.gen_time
 
           resp.verify(req, store, chain) &&
@@ -372,8 +414,9 @@ module Sigstore
         rescue OpenSSL::Timestamp::TimestampError => e
           logger.error { "timestamp verification failed (#{e})" }
           false
-        end ||
-          raise(OpenSSL::Timestamp::TimestampError, "timestamp verification failed")
+        end
+
+        raise(OpenSSL::Timestamp::TimestampError, "timestamp verification failed") unless verified
         resp.token_info.gen_time
       end
     end

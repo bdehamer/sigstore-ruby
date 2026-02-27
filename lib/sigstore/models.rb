@@ -114,6 +114,16 @@ module Sigstore
         raise Error::InvalidVerificationInput, "Unsupported artifact data: #{artifact.data}"
       end
 
+      # Validate that the bundle's message_digest (if present) matches the computed hash
+      if sbundle.message_signature? && sbundle.message_signature.message_digest &&
+         !sbundle.message_signature.message_digest.digest.empty?
+        bundle_digest = sbundle.message_signature.message_digest
+        if bundle_digest.digest != @hashed_input.digest
+          raise Error::InvalidBundle,
+                "bundle message digest does not match artifact"
+        end
+      end
+
       freeze
     end
   end
