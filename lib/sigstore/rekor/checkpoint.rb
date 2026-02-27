@@ -65,13 +65,13 @@ module Sigstore
 
         def verify(rekor_keyring, key_id)
           data = note.encode("utf-8")
-          signatures.each do |signature|
-            sig_hash = key_id[0, 4]
-            if signature.sig_hash != sig_hash
-              raise Error::InvalidCheckpoint,
-                    "sig_hash hint #{signature.sig_hash.inspect} does not match key_id #{sig_hash.inspect}"
-            end
+          sig_hash = key_id[0, 4]
 
+          # Find signatures that match the expected key_id hint
+          matching = signatures.select { |sig| sig.sig_hash == sig_hash }
+          raise Error::InvalidCheckpoint, "no matching signature for log key" if matching.empty?
+
+          matching.each do |signature|
             rekor_keyring.verify(key_id: key_id.unpack1("H*"), signature: signature.signature, data:)
           end
         end
