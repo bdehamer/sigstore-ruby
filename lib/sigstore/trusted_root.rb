@@ -47,7 +47,7 @@ module Sigstore
 
     def rekor_keys
       keys = tlog_keys(tlogs).to_a
-      raise Error::InvalidBundle, "Did not find one Rekor key" if keys.size != 1
+      raise Error::InvalidBundle, "Did not find any Rekor keys" if keys.empty?
 
       keys
     end
@@ -87,7 +87,8 @@ module Sigstore
 
       tlogs.each do |transparency_log_instance|
         key = transparency_log_instance.public_key
-        parsed_key = Internal::Key.from_key_details(key.key_details, key.raw_bytes)
+        log_id = Internal::Util.hex_encode(transparency_log_instance.log_id.key_id)
+        parsed_key = Internal::Key.from_key_details(key.key_details, key.raw_bytes, key_id: log_id)
         yield parsed_key if parsed_key
       end
     end

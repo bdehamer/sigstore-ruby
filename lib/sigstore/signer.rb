@@ -59,6 +59,54 @@ module Sigstore
       bundle
     end
 
+    def sign_dsse(statement_payload)
+      keypair = generate_keypair
+      csr = generate_csr(keypair)
+      leaf = fetch_cert(csr)
+      verify_chain(leaf)
+
+      # Build DSSE envelope
+      payload_type = "application/vnd.in-toto+json"
+      pae = "DSSEv1 #{payload_type.bytesize} #{payload_type} " \
+            "#{statement_payload.bytesize} #{statement_payload}".b
+      signature = keypair.sign("SHA256", pae)
+
+      # Get timestamp
+      timestamp_verification_data = submit_signature_hash_to_timstamping_service(signature)
+
+      # Build the intoto/dsse entry for Rekor
+      proposed_entry = build_proposed_intoto_entry(statement_payload, signature, leaf)
+
+      ctlog = @trusted_root.tlog_for_signing
+      logger.info { "Submitting DSSE entry to #{ctlog.base_url}" }
+      tlog_entry = @verifier.rekor_client.log.entries.post(proposed_entry)
+
+      bundle = collect_dsse_bundle(leaf, [tlog_entry], timestamp_verification_data,
+                                   payload_type, statement_payload, signature)
+
+      # Verify the DSSE bundle
+      hashed_input = Common::V1::HashOutput.new
+      hashed_input.algorithm = Common::V1::HashAlgorithm::SHA2_256
+      in_toto = JSON.parse(statement_payload)
+      subject = in_toto.fetch("subject").first
+      digest_value = subject.fetch("digest").values.first
+      hashed_input.digest = Internal::Util.hex_decode(digest_value)
+
+      verification_input = Verification::V1::Input.new
+      verification_input.bundle = bundle
+      verification_input.artifact = Verification::V1::Artifact.new
+      verification_input.artifact.artifact_uri = "sha256:#{digest_value}"
+
+      result = @verifier.verify(
+        input: VerificationInput.new(verification_input),
+        policy: expected_identity,
+        offline: false
+      )
+      raise Error::Signing, "Failed to verify DSSE: #{result.reason}" unless result.verified?
+
+      bundle
+    end
+
     private
 
     def generate_keypair
@@ -189,12 +237,57 @@ module Sigstore
     end
 
     # TODO: implement
-    def submit_signature_hash_to_timstamping_service(_signature)
+    def submit_signature_hash_to_timstamping_service(signature)
       # The Signer sends a hash of the signature as the messageImprint in a TimeStampReq to the Timestamping Service and
       # receives a TimeStampResp including a `TimeStampToken`.
       # The signer MUST verify the TimeStampToken against the payload and Timestamping Service root certificate.
 
-      nil
+      timestamp_authorities = @trusted_root.timestamp_authorities
+      return nil if timestamp_authorities.empty?
+
+      timestamps = []
+      timestamp_authorities.each do |ta|
+        next unless @trusted_root.send(:timerange_valid?, ta.valid_for, allow_expired: false)
+
+        tsa_url = URI.parse(ta.uri)
+        digest = OpenSSL::Digest::SHA256.digest(signature)
+
+        req = OpenSSL::Timestamp::Request.new
+        req.algorithm = "SHA256"
+        req.message_imprint = digest
+        req.cert_requested = true
+
+        net = defined?(Gem::Net) ? Gem::Net : Net
+        resp = net::HTTP.post(
+          tsa_url,
+          req.to_der,
+          { "Content-Type" => "application/timestamp-query", "User-Agent" => Sigstore::USER_AGENT }
+        )
+
+        unless resp.code == "200"
+          logger.warn { "TSA request to #{tsa_url} failed: #{resp.code} #{resp.message}" }
+          next
+        end
+
+        tsr = OpenSSL::Timestamp::Response.new(resp.body)
+        unless tsr.status == 0
+          logger.warn { "TSA response status: #{tsr.status}" }
+          next
+        end
+
+        logger.debug { "Got timestamp from #{tsa_url}" }
+        ts = Common::V1::RFC3161SignedTimestamp.new
+        ts.signed_timestamp = tsr.to_der
+        timestamps << ts
+      rescue StandardError => e
+        logger.warn { "TSA request to #{ta.uri} failed: #{e}" }
+      end
+
+      return nil if timestamps.empty?
+
+      tvd = Bundle::V1::TimestampVerificationData.new
+      tvd.rfc3161_timestamps = timestamps
+      tvd
     end
 
     def build_proposed_hashed_rekord_entry(signature, cert, hashed_input)
@@ -279,6 +372,58 @@ module Sigstore
         ms.signature = signature
       end
       bundle
+    end
+
+    def collect_dsse_bundle(leaf_certificate, tlog_entries, timestamp_verification_data,
+                            payload_type, payload, signature)
+      bundle = Bundle::V1::Bundle.new
+      bundle.media_type = BundleType::BUNDLE_0_3.media_type
+      bundle.verification_material = Bundle::V1::VerificationMaterial.new
+      bundle.verification_material.certificate = Common::V1::X509Certificate.new
+      bundle.verification_material.certificate.raw_bytes = leaf_certificate.to_der
+      bundle.verification_material.tlog_entries = tlog_entries
+      bundle.verification_material.timestamp_verification_data = timestamp_verification_data
+      bundle.dsse_envelope = DSSE::Envelope.new.tap do |env|
+        env.payloadType = payload_type
+        env.payload = payload
+        env.signatures = [
+          DSSE::Signature.new.tap { |s| s.sig = signature }
+        ]
+      end
+      bundle
+    end
+
+    def build_proposed_intoto_entry(statement_payload, signature, cert)
+      {
+        "apiVersion" => "0.0.2",
+        "kind" => "intoto",
+        "spec" => {
+          "content" => {
+            "envelope" => {
+              "payloadType" => "application/vnd.in-toto+json",
+              "payload" => Internal::Util.base64_encode(Internal::Util.base64_encode(statement_payload)),
+              "signatures" => [
+                {
+                  "publicKey" => Internal::Util.base64_encode(
+                    "-----BEGIN CERTIFICATE-----\n" \
+                    "#{Internal::Util.base64_encode(cert.to_der)}\n" \
+                    "-----END CERTIFICATE-----\n"
+                  ),
+                  "sig" => Internal::Util.base64_encode(Internal::Util.base64_encode(signature))
+                }
+              ]
+            },
+            "payloadHash" => {
+              "algorithm" => "sha256",
+              "value" => OpenSSL::Digest::SHA256.hexdigest(statement_payload)
+            },
+            "hash" => {
+              "algorithm" => "sha256",
+              "value" => "" # Will be set by Rekor
+            }
+          }
+        }
+      }
     end
   end
 end

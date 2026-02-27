@@ -52,14 +52,21 @@ module Sigstore
     option :bundle, type: :string, desc: "Path to the signed bundle"
     option :trusted_root, type: :string, desc: "Path to the trusted root"
     option :update_trusted_root, type: :boolean, desc: "Update the trusted root", default: true
+    option :key, type: :string, desc: "Path to the public key (PEM) for managed key verification"
     exclusive :bundle, :signature
     exclusive :bundle, :certificate
     def verify(*files)
       verifier, files_with_materials = collect_verification_state(files)
-      policy = Sigstore::Policy::Identity.new(
-        identity: options[:certificate_identity],
-        issuer: options[:certificate_oidc_issuer]
-      )
+
+      if options[:key]
+        # Public key verification — no identity policy needed
+        policy = Sigstore::Policy::UnsafeNoOp.new
+      else
+        policy = Sigstore::Policy::Identity.new(
+          identity: options[:certificate_identity],
+          issuer: options[:certificate_oidc_issuer]
+        )
+      end
 
       verified = files_with_materials.all? do |file, input|
         result = verifier.verify(input:, policy:, offline: options[:offline])
@@ -84,6 +91,8 @@ module Sigstore
     option :signature, type: :string, desc: "Path to write the signature to"
     option :certificate, type: :string, desc: "Path to the public certificate"
     option :trusted_root, type: :string, desc: "Path to the trusted root"
+    option :signing_config, type: :string, desc: "Path to the signing config"
+    option :in_toto, type: :boolean, desc: "Treat input as an in-toto statement"
     option :update_trusted_root, type: :boolean, desc: "Update the trusted root", default: true
     def sign(file)
       self.options = options.merge(identity_token: IdToken.detect_credential).freeze if options[:identity_token].nil?
@@ -93,13 +102,19 @@ module Sigstore
       end
 
       contents = File.binread(file)
-      bundle = Sigstore::Signer.new(
+      signer = Sigstore::Signer.new(
         jwt: options[:identity_token],
         trusted_root:
-      ).sign(contents)
+      )
+
+      bundle = if options[:in_toto]
+                 signer.sign_dsse(contents)
+               else
+                 signer.sign(contents)
+               end
 
       File.binwrite(options[:bundle], bundle.to_json) if options[:bundle]
-      if options[:signature]
+      if options[:signature] && bundle.message_signature
         File.binwrite(options[:signature], Internal::Util.base64_encode(bundle.message_signature.signature))
       end
       File.binwrite(options[:certificate], bundle.verification_material.certificate.raw_bytes) if options[:certificate]
@@ -259,7 +274,10 @@ module Sigstore
         end
 
         say "Verifying #{file}..."
-        all_materials << [file, Sigstore::VerificationInput.new(verification_input)]
+        public_key = if options[:key]
+                       OpenSSL::PKey.read(File.binread(options[:key]))
+                     end
+        all_materials << [file, Sigstore::VerificationInput.new(verification_input, public_key: public_key)]
       end
 
       [verifier, all_materials]

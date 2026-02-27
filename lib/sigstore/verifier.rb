@@ -67,7 +67,22 @@ module Sigstore
       # of the signature as the timestamped data. The Verifier MUST then extract a timestamp from the timestamping
       # response. If verification or timestamp parsing fails, the Verifier MUST abort.
 
-      timestamps = extract_timestamp_from_verification_data(materials.timestamp_verification_data) || []
+      # Extract the signature from the bundle for timestamp verification
+      bundle_signature = case bundle.content
+                         when :message_signature
+                           bundle.message_signature.signature
+                         when :dsse_envelope
+                           # For DSSE, the PAE-encoded envelope is signed
+                           pae = "DSSEv1 #{bundle.dsse_envelope.payloadType.bytesize} " \
+                                 "#{bundle.dsse_envelope.payloadType} " \
+                                 "#{bundle.dsse_envelope.payload.bytesize} " \
+                                 "#{bundle.dsse_envelope.payload}".b
+                           bundle.dsse_envelope.signatures.first&.sig
+                         end
+
+      timestamps = extract_timestamp_from_verification_data(
+        materials.timestamp_verification_data, signature: bundle_signature
+      ) || []
 
       # 2)
       # If the verification policy uses timestamps from the Transparency Service, the Verifier MUST verify the signature
@@ -79,7 +94,7 @@ module Sigstore
       begin
         # TODO: should this instead be an input to the verify method?
         # See https://docs.google.com/document/d/1kbhK2qyPPk8SLavHzYSDM8-Ueul9_oxIMVFuWMWKz0E/edit?disco=AAABQVV-gT0
-        entry = find_rekor_entry(bundle, input.hashed_input, offline:)
+        entry = find_rekor_entry(bundle, input, offline:)
       rescue Sigstore::Error::MissingRekorEntry
         return VerificationFailure.new("Rekor entry not found")
       else
@@ -95,69 +110,55 @@ module Sigstore
 
       Internal::SET.verify_set(keyring: @rekor_keyring, entry:) if entry.inclusion_promise
 
-      timestamps << Time.at(entry.integrated_time).utc
+      timestamps << Time.at(entry.integrated_time).utc if entry.integrated_time && entry.integrated_time > 0
 
-      # 3)
-      # The Verifier MUST perform certification path validation (RFC 5280 §6) of the certificate chain with the
-      # pre-distributed Fulcio root certificate(s) as a trust anchor, but with a fake “current time.”
-      # If a timestamp from the timestamping service is available, the Verifier MUST perform path validation using the
-      # timestamp from the Timestamping Service. If a timestamp from the Transparency Service is available, the Verifier
-      # MUST perform path validation using the timestamp from the Transparency Service. If both are available, the
-      # Verifier performs path validation twice. If either fails, verification fails.
-
-      chains = timestamps.map do |ts|
-        chain, err = Internal::X509.validate_chain(@fulcio_cert_chains, bundle.leaf_certificate, ts)
-        return err if err
-
-        chain
+      if timestamps.empty?
+        return VerificationFailure.new("No valid timestamps found")
       end
 
-      chains.uniq! { |chain| chain.map(&:to_der) }
-      unless chains.size == 1
-        raise "expected exactly one certificate chain, got #{chains.size} chains:\n" +
-              chains.map do |chain|
-                chain.map(&:to_text).join("\n")
-              end.join("\n\n")
+      if bundle.leaf_certificate
+        # 3) Certificate path validation
+        chains = timestamps.map do |ts|
+          chain, err = Internal::X509.validate_chain(@fulcio_cert_chains, bundle.leaf_certificate, ts)
+          return err if err
+
+          chain
+        end
+
+        chains.uniq! { |chain| chain.map(&:to_der) }
+        unless chains.size == 1
+          raise "expected exactly one certificate chain, got \#{chains.size} chains:\n" +
+                chains.map do |chain|
+                  chain.map(&:to_text).join("\n")
+                end.join("\n\n")
+        end
+
+        # 4) SCT verification
+        chain = chains.first
+        if (result = verify_scts(bundle.leaf_certificate, chain)) && !result.verified?
+          return result
+        end
+
+        # 5) Policy check
+        usage_ext = bundle.leaf_certificate.extension(Internal::X509::Extension::KeyUsage)
+        return VerificationFailure.new("Key usage is not of type `digital signature`") unless usage_ext.digital_signature
+
+        extended_key_usage = bundle.leaf_certificate.extension(Internal::X509::Extension::ExtendedKeyUsage)
+        unless extended_key_usage.code_signing?
+          return VerificationFailure.new("Extended key usage is not of type `code signing`")
+        end
+
+        policy_check = policy.verify(bundle.leaf_certificate)
+        return policy_check unless policy_check.verified?
+
+        signing_key = bundle.leaf_certificate.public_key
+      else
+        # Public key verification -- skip certificate-specific checks
+        signing_key = input.public_key
+        return VerificationFailure.new("No public key provided for bundle verification") unless signing_key
       end
 
-      # 4)
-      # Unless performing online verification (see §Alternative Workflows), the Verifier MUST extract the
-      # SignedCertificateTimestamp embedded in the leaf certificate, and verify it as in RFC 9162 §8.1.3,
-      # using the verification key from the Certificate Transparency Log.
-      chain = chains.first
-      if (result = verify_scts(bundle.leaf_certificate, chain)) && !result.verified?
-        return result
-      end
-
-      # 5)
-      # The Verifier MUST then check the certificate against the verification policy.
-
-      usage_ext = bundle.leaf_certificate.extension(Internal::X509::Extension::KeyUsage)
-      return VerificationFailure.new("Key usage is not of type `digital signature`") unless usage_ext.digital_signature
-
-      extended_key_usage = bundle.leaf_certificate.extension(Internal::X509::Extension::ExtendedKeyUsage)
-      unless extended_key_usage.code_signing?
-        return VerificationFailure.new("Extended key usage is not of type `code signing`")
-      end
-
-      policy_check = policy.verify(bundle.leaf_certificate)
-      return policy_check unless policy_check.verified?
-
-      # 6)
-      # By this point, the Verifier has already verified the signature by the Transparency Service (§Establishing a Time
-      #  for the Signature). The Verifier MUST parse body: body is a base64-encoded JSON document with keys apiVersion
-      #  and kind. The Verifier implementation contains a list of known Transparency Service formats (by apiVersion and
-      #  kind); if no type is found, abort. The Verifier MUST parse body as the given type.
-      #
-      # Then, the Verifier MUST check the following; exactly how to do this will be specified by each type in Spec:
-      # Sigstore Registries (§Signature Metadata Formats):
-      #
-      #  * The signature from the parsed body is the same as the provided signature.
-      #  * The key or certificate from the parsed body is the same as in the input certificate.
-      #  * The “subject” of the parsed body matches the artifact.
-
-      signing_key = bundle.leaf_certificate.public_key
-
+      # 6) Signature verification
       case bundle.content
       when :message_signature
         verified = verify_raw(signing_key, bundle.message_signature.signature, input.hashed_input.digest)
@@ -176,10 +177,10 @@ module Sigstore
           verify_in_toto(input, in_toto)
         else
           raise Sigstore::Error::Unimplemented,
-                "unsupported DSSE payload type: #{bundle.dsse_envelope.payloadType.inspect}"
+                "unsupported DSSE payload type: \#{bundle.dsse_envelope.payloadType.inspect}"
         end
       else
-        raise Error::InvalidBundle, "unknown content type: #{bundle.content}"
+        raise Error::InvalidBundle, "unknown content type: \#{bundle.content}"
       end
 
       VerificationSuccess.new
@@ -345,23 +346,22 @@ module Sigstore
       issuer
     end
 
-    def extract_timestamp_from_verification_data(data)
-      # TODO: allow requiring a verified timestamp
+    def extract_timestamp_from_verification_data(data, signature: nil)
       unless data
         logger.debug { "no timestamp verification data" }
         return nil
       end
 
-      # Checks for https://github.com/ruby/openssl/pull/770
-      if OpenSSL::X509::Store.new.instance_variable_defined?(:@time)
-        logger.warn do
-          "OpenSSL::X509::Store on this version of openssl (#{OpenSSL::VERSION}) does not set time properly, " \
-            "this breaks TSA verification"
-        end
-        return
-      end
+      return nil if data.rfc3161_timestamps.empty?
 
-      authorities = @timestamp_authorities.map do |ta|
+      authorities = @timestamp_authorities.filter_map do |ta|
+        # Check TSA validity period against trusted root
+        if ta.valid_for
+          now = Time.now.utc
+          next if ta.valid_for.start && now < ta.valid_for.start.to_time
+          # Don't filter on end time here — the timestamp gen_time will be checked later
+        end
+
         store = OpenSSL::X509::Store.new
         chain = ta.cert_chain.certificates.map do |cert|
           Internal::X509::Certificate.read(cert.raw_bytes).openssl
@@ -376,19 +376,35 @@ module Sigstore
       data.rfc3161_timestamps.map do |ts|
         resp = OpenSSL::Timestamp::Response.new(ts.signed_timestamp)
 
+        # Verify the message imprint matches the hash of the signature
+        if signature
+          expected_imprint = OpenSSL::Digest::SHA256.digest(signature)
+          actual_imprint = resp.token_info.message_imprint
+          unless actual_imprint == expected_imprint
+            raise OpenSSL::Timestamp::TimestampError,
+                  "timestamp message imprint does not match signature"
+          end
+        end
+
         req = OpenSSL::Timestamp::Request.new
         req.cert_requested = !resp.token.certificates.empty?
-        # TODO: verify the message imprint against the signature in the bundle
         req.message_imprint = resp.token_info.message_imprint
         req.algorithm = resp.token_info.algorithm
         req.policy_id = resp.token_info.policy_id
-        req.nonce = resp.token_info.nonce
+        req.nonce = resp.token_info.nonce if resp.token_info.nonce
         req.version = resp.token_info.version
 
-        # TODO: verify the hashed message in the message imprint
-        # against the signature in the bundle
+        # Check that the timestamp gen_time falls within the TSA's validity period
+        verified = authorities.any? do |ta, chain, store|
+          # Check TSA validity against the timestamp gen_time
+          if ta.valid_for&.end
+            tsa_end = ta.valid_for.end.to_time
+            if resp.token_info.gen_time > tsa_end
+              logger.debug { "timestamp gen_time #{resp.token_info.gen_time} is after TSA validity end #{tsa_end}" }
+              next false
+            end
+          end
 
-        authorities.any? do |ta, chain, store|
           store.time = resp.token_info.gen_time
 
           resp.verify(req, store, chain) &&
@@ -398,13 +414,14 @@ module Sigstore
         rescue OpenSSL::Timestamp::TimestampError => e
           logger.error { "timestamp verification failed (#{e})" }
           false
-        end ||
-          raise(OpenSSL::Timestamp::TimestampError, "timestamp verification failed")
+        end
+
+        raise(OpenSSL::Timestamp::TimestampError, "timestamp verification failed") unless verified
         resp.token_info.gen_time
       end
     end
 
-    def find_rekor_entry(bundle, hashed_input, offline:)
+    def find_rekor_entry(bundle, input, offline:)
       raise Error::InvalidBundle, "multiple tlog entries" if bundle.verification_material.tlog_entries.size > 1
 
       rekor_entry = bundle.verification_material.tlog_entries&.first
@@ -416,7 +433,8 @@ module Sigstore
           "has_inclusion_promise=#{has_inclusion_promise} has_inclusion_proof=#{has_inclusion_proof}"
       end
 
-      expected_entry = bundle.expected_tlog_entry(hashed_input)
+      hashed_input = input.hashed_input
+      expected_entry = bundle.expected_tlog_entry(hashed_input, public_key: input.public_key)
 
       entry = if offline
                 logger.debug { "Offline verification, skipping rekor" }
@@ -447,13 +465,15 @@ module Sigstore
         # *cannot* verify, since the envelope is uncanonicalized JSON.
         # Instead, we manually pick apart the entry body below and verify
         # the parts we can (namely the payload hash and signature list).
-        case actual_body["kind"]
-        when "intoto"
+        case [actual_body["kind"], actual_body["apiVersion"]]
+        when ["intoto", "0.0.2"]
           actual_body["spec"]["content"].delete("hash")
-        when "dsse"
+        when ["dsse", "0.0.1"]
           actual_body["spec"].delete("envelopeHash")
+        when ["dsse", "0.0.2"]
+          # v002 DSSE entries don't have a separate envelope hash to strip
         else
-          raise Error::InvalidRekorEntry, "Unknown kind: #{actual_body["kind"]}"
+          raise Error::InvalidRekorEntry, "Unknown DSSE kind/version: #{actual_body["kind"]}/#{actual_body["apiVersion"]}"
         end
       end
 

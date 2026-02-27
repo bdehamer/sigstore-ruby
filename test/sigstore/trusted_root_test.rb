@@ -9,9 +9,10 @@ class Sigstore::TrustedRootTest < Test::Unit::TestCase
       Timecop.freeze(cassette.originally_recorded_at || Time.now) do
         production = Sigstore::TrustedRoot.production
         assert_equal "application/vnd.dev.sigstore.trustedroot+json;version=0.1", production.media_type
-        assert_equal ["MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9f\n" \
-                      "AFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RY\n" \
-                      "tw==\n"], production.rekor_keys.map { [_1.to_der].pack("m") }
+        assert_includes production.rekor_keys.map { [_1.to_der].pack("m") },
+                        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9f\n" \
+                        "AFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RY\n" \
+                        "tw==\n"
         assert_equal ["MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbfwR+RJudXscgRBRpKX1XFDy\n" \
                       "3PyudDxz/SfnRi1fT8ekpfBd2O1uoz7jr3Z8nKzxA69EUQ+eFCFI3zeubPWU\n" \
                       "7w==\n",
