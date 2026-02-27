@@ -21,7 +21,7 @@ module Sigstore
     class Key
       include Loggable
 
-      def self.from_key_details(key_details, key_bytes)
+      def self.from_key_details(key_details, key_bytes, key_id: nil)
         case key_details
         when Common::V1::PublicKeyDetails::PKIX_ECDSA_P256_SHA_256
           key_type = "ecdsa"
@@ -40,7 +40,8 @@ module Sigstore
           return nil
         end
 
-        read(key_type, key_schema, key_bytes, key_id: OpenSSL::Digest::SHA256.hexdigest(key_bytes))
+        key_id ||= OpenSSL::Digest::SHA256.hexdigest(key_bytes)
+        read(key_type, key_schema, key_bytes, key_id: key_id)
       end
 
       def self.read(key_type, schema, key_bytes, key_id: nil)
