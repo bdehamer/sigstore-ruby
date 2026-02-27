@@ -91,6 +91,8 @@ module Sigstore
     option :signature, type: :string, desc: "Path to write the signature to"
     option :certificate, type: :string, desc: "Path to the public certificate"
     option :trusted_root, type: :string, desc: "Path to the trusted root"
+    option :signing_config, type: :string, desc: "Path to the signing config"
+    option :in_toto, type: :boolean, desc: "Treat input as an in-toto statement"
     option :update_trusted_root, type: :boolean, desc: "Update the trusted root", default: true
     def sign(file)
       self.options = options.merge(identity_token: IdToken.detect_credential).freeze if options[:identity_token].nil?
@@ -100,13 +102,19 @@ module Sigstore
       end
 
       contents = File.binread(file)
-      bundle = Sigstore::Signer.new(
+      signer = Sigstore::Signer.new(
         jwt: options[:identity_token],
         trusted_root:
-      ).sign(contents)
+      )
+
+      bundle = if options[:in_toto]
+                 signer.sign_dsse(contents)
+               else
+                 signer.sign(contents)
+               end
 
       File.binwrite(options[:bundle], bundle.to_json) if options[:bundle]
-      if options[:signature]
+      if options[:signature] && bundle.message_signature
         File.binwrite(options[:signature], Internal::Util.base64_encode(bundle.message_signature.signature))
       end
       File.binwrite(options[:certificate], bundle.verification_material.certificate.raw_bytes) if options[:certificate]
